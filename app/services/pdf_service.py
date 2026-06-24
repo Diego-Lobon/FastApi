@@ -6,167 +6,89 @@ from app.core.config import DB, PASSWORD
 
 
 def extract_products(pdf_path):
-
     uid, models = connect_odoo()
-
     products = []
-
-    # NUEVO
     id_precio_lista = None
+    item_blocks = []
 
-    # ==========================
-    # EXTRAER TEXTO DEL PDF
-    # ==========================
-
+    all_text = ""
     all_lines = []
 
+    # ==========================================
+    # 1. EXTRAER TEXTO GENERAL
+    # ==========================================
     with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-
+        for index, page in enumerate(pdf.pages):
             text = page.extract_text()
-
             if text:
+                all_text += text + "\n"
+                all_lines.extend(text.split("\n"))
+                
+    print("--- INICIO TEXTO COMPLETO DEL PDF ---")
+    print(all_text)
+    print("--- FIN TEXTO COMPLETO DEL PDF ---")
 
-                lines = text.split("\n")
+    # Extraer ID: COT-8457-08 -> 8
+    match_id = re.search(r"COT-\d+-(\d+)", all_text, re.IGNORECASE)
+    if match_id:
+        id_precio_lista = int(match_id.group(1))
+        print("ID EXTRAIDO:", id_precio_lista)
 
-                all_lines.extend(lines)
-
-    # ==========================
-    # EXTRAER ID
-    # Busca:
-    # ID: 8
-    # ==========================
-
+    # ==========================================
+    # 2. EXTRAER CÓDIGOS DE PRODUCTO Y CANTIDADES
+    # ==========================================
     for line in all_lines:
-
-        line_str = line.strip()
-
-        match_id = re.search(
-            r"\bID\s*:\s*(\d+)\b",
-            line_str,
-            re.IGNORECASE,
-        )
-
-        if match_id:
-
-            id_precio_lista = int(
-                match_id.group(1)
-            )
-
-            print("ID EXTRAIDO:", id_precio_lista)
-
-            break
-
-    # ==========================
-    # AGRUPAR ITEMS
-    # ==========================
-
-    item_blocks = []
-    current_block = []
-    dentro_de_tabla = False
-
-    for line in all_lines:
-
-        line_str = line.strip()
-
-        if not line_str:
+        line_clean = line.strip()
+        
+        if not line_clean:
             continue
 
-        if (
-            "Precio Unit" in line
-            or "Descripcion" in line
-        ):
-            dentro_de_tabla = True
-            continue
+        # REGEX MODIFICADO: 
+        # 1. ^(\d{1,3})\s+            -> Item inicial (ej: 04)
+        # 2. ([A-Za-z0-9\-]{5,15})    -> Código alfa-numérico con guiones (ej: 10022087-1)
+        # 3. \s+(.+?)\s+              -> Descripción (búsqueda no ambiciosa)
+        # 4. (\d+)\s+(?:\$|S\/)       -> Cantidad seguida de un símbolo de precio ($ o S/)
+        match_producto = re.match(r"^(\d{1,3})\s+([A-Za-z0-9\-]{5,15})\s+(.+?)\s+(\d+)\s+(?:\$|S\/)", line_clean)
+        
+        if match_producto:
+            codigo_detectado = match_producto.group(2)
+            cantidad_detectada = int(match_producto.group(4))
+            
+            print(f"-> [LOG] Línea coincide con producto. Código: {codigo_detectado} | Cantidad: {cantidad_detectada}")
+            
+            item_blocks.append({
+                "codigo": codigo_detectado,
+                "cantidad": cantidad_detectada
+            })
+        else:
+            # Plan de contingencia si la descripción es muy larga y deforma el final de la línea
+            match_auxiliar = re.match(r"^(\d{1,3})\s+([A-Za-z0-9\-]{5,15})\s+", line_clean)
+            if match_auxiliar and not line_clean.startswith("Op. Gravada"):
+                codigo_detectado = match_auxiliar.group(2)
+                
+                # Intentamos rescatar la cantidad buscando el número previo al precio
+                buscar_cantidad = re.search(r"\s+(\d+)\s+(?:\$|S\/)", line_clean)
+                cantidad_detectada = int(buscar_cantidad.group(1)) if buscar_cantidad else 1
+                
+                print(f"-> [LOG RECOV] Rescatado -> Código: {codigo_detectado} | Cantidad: {cantidad_detectada}")
+                
+                item_blocks.append({
+                    "codigo": codigo_detectado,
+                    "cantidad": cantidad_detectada
+                })
 
-        if (
-            "Sub Total" in line
-            or "Subtotal" in line
-            or "Gracias por su preferencia" in line
-        ):
+    print("\n==================================")
+    print("TOTAL DE ITEMS EXTRAIDOS INTERNAMENTE:", item_blocks)
+    print("==================================\n")
 
-            dentro_de_tabla = False
+    # ==========================================
+    # 3. CONSULTAR STOCK ODOO
+    # ==========================================
+    for item in item_blocks:
+        codigo = item["codigo"]
+        cantidad = item["cantidad"]
 
-            if current_block:
-                item_blocks.append(current_block)
-
-                current_block = []
-
-            continue
-
-        if dentro_de_tabla:
-
-            es_nuevo_item = re.match(
-                r"^\s*\d+\s+",
-                line
-            )
-
-            if es_nuevo_item:
-
-                if current_block:
-                    item_blocks.append(
-                        current_block
-                    )
-
-                current_block = [line_str]
-
-            else:
-
-                if current_block:
-                    current_block.append(
-                        line_str
-                    )
-
-    if current_block:
-        item_blocks.append(current_block)
-
-    # ==========================
-    # PROCESAR ITEMS
-    # ==========================
-
-    for block in item_blocks:
-
-        lineas = block.copy()
-
-        if (
-            len(lineas) > 1
-            and re.match(r"^-\w+", lineas[1])
-        ):
-
-            sufijo = re.match(
-                r"^(-[\w]+)",
-                lineas[1]
-            ).group(1)
-
-            lineas[0] = re.sub(
-                r"^(\d+\s+[\w]+)",
-                lambda m: m.group(1) + sufijo,
-                lineas[0],
-            )
-
-            lineas[1] = re.sub(
-                r"^-\w+\s*",
-                "",
-                lineas[1],
-            )
-
-        full_text = " ".join(lineas)
-
-        print("ITEM:", full_text)
-
-        match = re.search(
-            r"^\d+\s+([\w\-]+).*?(?:\$|S/)\s+\d+\.\d+\s+(\d+)\s+IGV",
-            full_text
-        )
-
-        if not match:
-            continue
-
-        codigo = match.group(1)
-
-        cantidad = int(
-            match.group(2)
-        )
+        print(f"BUSCANDO EN ODOO CÓDIGO: {codigo}")
 
         producto = models.execute_kw(
             DB,
@@ -174,50 +96,35 @@ def extract_products(pdf_path):
             PASSWORD,
             "product.product",
             "search_read",
-            [
-                [
-                    (
-                        "default_code",
-                        "=",
-                        codigo
-                    )
-                ]
-            ],
+            [[("default_code", "=", codigo)]],
             {
-                "fields": [
-                    "name",
-                    "qty_available"
-                ],
-                "limit": 1
-            }
+                "fields": ["name", "qty_available"],
+                "limit": 1,
+            },
         )
 
         if producto:
-
             stock = producto[0]["qty_available"]
-
+            print(f"✅ ¡Encontrado en Odoo! {producto[0]['name']} - Stock: {stock}")
             products.append({
                 "codigo": codigo,
                 "nombre": producto[0]["name"],
                 "cantidad": cantidad,
                 "stock_libre": stock,
-                "disponible": stock >= cantidad
+                "disponible": (stock >= cantidad),
             })
-
         else:
-
+            print(f"⚠️ Código {codigo} no existe en Odoo.")
             products.append({
                 "codigo": codigo,
                 "nombre": f"No encontrado ({codigo})",
                 "cantidad": cantidad,
                 "stock_libre": 0,
-                "disponible": False
+                "disponible": False,
             })
 
     return {
         "codes_found": len(products),
         "products": products,
-
-        # NUEVO
-        "id_precio_lista": id_precio_lista
+        "id_precio_lista": id_precio_lista,
     }
